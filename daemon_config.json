@@ -1,0 +1,9 @@
+{
+    "api_listen": ":8080",
+    "api_token": "secret-token-1234",
+    "proxy_binary": "../Hytale-Proxy/proxy",
+    "proxy_args": [
+        "-config",
+        "../Hytale-Proxy/config/example.json"
+    ]
+}

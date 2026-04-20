@@ -60,10 +60,11 @@ func (s *Server) Start() error {
 
 // Payload expected for CreateServer from the Panel
 type CreateServerRequest struct {
-	ID      string `json:"id"`
-	Type    string `json:"server_type"` // "proxy" or "game"
-	Port    int    `json:"port"`
-	RAM     int    `json:"ram_mb"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Type     string `json:"server_type"` // "proxy" or "game"
+	Port     int    `json:"port"`
+	RAM      int    `json:"ram_mb"`
 	Version  string `json:"version"`
 	Hostname string `json:"hostname"`
 	Config   string `json:"config_json"` // Raw stringified internal JSON config for the Hytale-Proxy
@@ -102,7 +103,7 @@ func (s *Server) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Instantiate manager
-	srv := manager.NewServerManager(s.cfg, req.ID, req.Port, req.RAM, s.cfg.NodeIP, req.Version, req.Type, req.Hostname)
+	srv := manager.NewServerManager(s.node.Config(), req.ID, req.Name, req.Port, req.RAM, s.node.IP(), req.Version, req.Type, req.Hostname)
 	s.node.AddServer(req.ID, srv)
 
 	// Start it up via goroutine

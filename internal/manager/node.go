@@ -40,6 +40,9 @@ func NewNodeManager(cfg *config.DaemonConfig) *NodeManager {
 	return nm
 }
 
+func (nm *NodeManager) Config() *config.DaemonConfig { return nm.cfg }
+func (nm *NodeManager) IP() string                   { return nm.NodeIP }
+
 // RegisterInDatabase finds the Node by IP/Hostname in the database,
 // marks it as 'online', retrieves its UUID, and begins the RAM syncing routine.
 func (nm *NodeManager) RegisterInDatabase(ctx context.Context) error {
@@ -89,7 +92,7 @@ func (nm *NodeManager) EnsureMasterProxy(ctx context.Context) error {
 	masterID := "00000000-0000-0000-0000-000000005520"
 	
 	// We use 0 as RAM for master as it doesn't represent a game server
-	nm.MasterProxy = NewServerManager(nm.cfg, masterID, 5520, 0, nm.NodeIP, "master", "proxy", "")
+	nm.MasterProxy = NewServerManager(nm.cfg, masterID, "Master Proxy", 5520, 0, nm.NodeIP, "master", "proxy", "")
 	
 	// Sync initial routes before starting
 	if err := nm.SyncMasterRoutes(ctx); err != nil {
@@ -218,7 +221,7 @@ func (nm *NodeManager) RemoveServer(serverID string) {
 // LoadExistingServers queries the database for ALL servers assigned to this node,
 // maps them into memory, and only auto-starts the ones that were 'running'.
 func (nm *NodeManager) LoadExistingServers(ctx context.Context) error {
-	query := `SELECT id, port, ram_mb, version, status, server_type, hostname FROM servers WHERE node_id = $1`
+	query := `SELECT id, name, port, ram_mb, version, status, server_type, hostname FROM servers WHERE node_id = $1`
 	
 	rows, err := database.Pool.Query(ctx, query, nm.NodeID)
 	if err != nil {
@@ -227,14 +230,14 @@ func (nm *NodeManager) LoadExistingServers(ctx context.Context) error {
 	defer rows.Close()
 
 	for rows.Next() {
-		var id, version, status, sType, hostname string
+		var id, name, version, status, sType, hostname string
 		var port, ram int
 		
-		if err := rows.Scan(&id, &port, &ram, &version, &status, &sType, &hostname); err != nil {
+		if err := rows.Scan(&id, &name, &port, &ram, &version, &status, &sType, &hostname); err != nil {
 			continue
 		}
 
-		srv := NewServerManager(nm.cfg, id, port, ram, nm.NodeIP, version, sType, hostname)
+		srv := NewServerManager(nm.cfg, id, name, port, ram, nm.NodeIP, version, sType, hostname)
 		nm.AddServer(id, srv)
 		
 		if status == "running" {

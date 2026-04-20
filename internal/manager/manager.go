@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -31,6 +33,7 @@ const (
 type ServerManager struct {
 	cfg          *config.DaemonConfig
 	ID           string
+	Name         string
 	port         int
 	allocatedRAM int
 	nodeIP       string
@@ -47,10 +50,11 @@ type ServerManager struct {
 }
 
 // NewServerManager instantiates a struct to manage a specific server process.
-func NewServerManager(cfg *config.DaemonConfig, id string, port, ram int, nodeIP, version, sType, hostname string) *ServerManager {
+func NewServerManager(cfg *config.DaemonConfig, id, name string, port, ram int, nodeIP, version, sType, hostname string) *ServerManager {
 	return &ServerManager{
 		cfg:          cfg,
 		ID:           id,
+		Name:         name,
 		port:         port,
 		allocatedRAM: ram,
 		nodeIP:       nodeIP,
@@ -83,7 +87,12 @@ func (sm *ServerManager) spawn() error {
 	// but specifying its own isolated config file.
 	
 	// Ensure isolated execution folder exists
+	// We use Name-ID to ensure uniqueness while fulfilling user request for descriptive folders
 	workDir := filepath.Join("data", "servers", sm.ID)
+	if sm.Name != "" && sm.ID != "00000000-0000-0000-0000-000000005520" {
+		slugName := strings.ToLower(regexp.MustCompile(`[^a-zA-Z0-9]+`).ReplaceAllString(sm.Name, "-"))
+		workDir = filepath.Join("data", "servers", fmt.Sprintf("%s-%s", slugName, sm.ID))
+	}
 	_ = os.MkdirAll(workDir, 0755)
 
 	binaryPath := sm.cfg.ProxyBinary

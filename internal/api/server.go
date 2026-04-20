@@ -53,7 +53,6 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/servers/install", s.withAuth(s.handleInstallServer))
 	mux.HandleFunc("/api/node/sync-routes", s.withAuth(s.handleSyncRoutes))
 	mux.HandleFunc("/api/servers/command", s.withAuth(s.handleServerCommand))
-	mux.HandleFunc("/api/node/cli-auth", s.handleCLIAuthStream) // WebSocket, auth via token query param
 
 	// Wrap mux with CORS middleware
 	handler := s.withCORS(mux)

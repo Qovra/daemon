@@ -55,6 +55,10 @@ func Load(path string) (*DaemonConfig, error) {
 	} else if cfg.BackendURL == "" {
 		cfg.BackendURL = "http://localhost:3000"
 	}
+
+	if bin := os.Getenv("PROXY_BINARY"); bin != "" {
+		cfg.ProxyBinary = bin
+	}
 	
 	// Legacy daemon_config.json support for the execution layer
 	if cfg.ProxyBinary == "" {

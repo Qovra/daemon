@@ -104,14 +104,42 @@ func (sm *ServerManager) spawn() error {
 	var args []string
 
 	if sm.serverType == "game" {
-		// Mock: In a real Hytale server, this might be "java -jar server.jar"
-		// For now we look for a 'hytale-server' binary in the workdir
-		binaryPath = filepath.Join(workDir, "hytale-server")
-		if _, err := os.Stat(binaryPath); err != nil {
-			// If not found, use a mock script or return error
-			return fmt.Errorf("hytale-server binary not found. Please run installation first.")
+		// Hytale Server Logic (Official Specs)
+		// 1. Determine execution directory and asset location
+		execDir := workDir
+		assetsPath := "Assets.zip"
+		jarName := "HytaleServer.jar"
+
+		// Downloader CLI often creates a 'Server/' subfolder
+		if _, err := os.Stat(filepath.Join(workDir, "Server", jarName)); err == nil {
+			execDir = filepath.Join(workDir, "Server")
+			assetsPath = "../Assets.zip" // Assets.zip is usually in parent
+		} else if _, err := os.Stat(filepath.Join(workDir, jarName)); err != nil {
+			return fmt.Errorf("HytaleServer.jar not found in %s or %s/Server/. Please run installation first.", workDir, workDir)
 		}
-		args = []string{"-port", fmt.Sprint(sm.port)}
+
+		binaryPath = "java"
+		
+		// 2. Build official arguments
+		// We use -Xmx to limit memory based on allocated RAM
+		args = []string{
+			fmt.Sprintf("-Xmx%dM", sm.allocatedRAM),
+			"-Xms128M",
+		}
+
+		// Enable AOT Cache if file exists
+		if _, err := os.Stat(filepath.Join(execDir, "HytaleServer.aot")); err == nil {
+			args = append(args, "-XX:AOTCache=HytaleServer.aot")
+		}
+
+		args = append(args, "-jar", jarName)
+		args = append(args, "--assets", assetsPath)
+		args = append(args, "--bind", fmt.Sprintf("0.0.0.0:%d", sm.port))
+		args = append(args, "--auth-mode", "authenticated")
+		// args = append(args, "--disable-sentry") // Option for developer mode
+
+		// Update command execution directory
+		workDir = execDir
 	} else {
 		// Default Proxy behavior
 		args = []string{"-config", "config.json"}
@@ -126,7 +154,7 @@ func (sm *ServerManager) spawn() error {
 
 	if err := cmd.Start(); err != nil {
 		sm.actualState = StateCrashed
-		return fmt.Errorf("failed to spawn server proxy %s: %w", sm.ID, err)
+		return fmt.Errorf("failed to spawn server process %s: %w", sm.ID, err)
 	}
 
 	sm.cmd = cmd

@@ -116,47 +116,29 @@ func (i *Installer) InstallGameServer(ctx context.Context, serverID string) erro
 			}
 		}
 
-		// 2. Discover ZIP file
-		files, _ := os.ReadDir(workDir)
-		var zipFile string
-		for _, f := range files {
-			if strings.HasSuffix(f.Name(), ".zip") && f.Name() != "Assets.zip" {
-				zipFile = filepath.Join(workDir, f.Name())
-				break
-			}
-		}
+		// Per the official docs, hytale-downloader already creates the correct layout:
+		// workDir/
+		// ├── Assets.zip
+		// └── Server/
+		//     ├── HytaleServer.jar
+		//     └── HytaleServer.aot
+		// The recursive JAR search in spawn() will locate HytaleServer.jar automatically.
 
-		if zipFile == "" {
-			log.Printf("[installer-%s] No ZIP file found after downloader exit. Checking if it extracted directly...", serverID)
-		} else {
-			srv.WriteLog("[INSTALL] Extracting game files: " + filepath.Base(zipFile))
-			if err := unzip(zipFile, workDir); err != nil {
-				log.Printf("[installer-%s] Failed to unzip: %v", serverID, err)
-				srv.WriteLog("[INSTALL-ERR] Extraction failed: " + err.Error())
-				i.reportProgress(serverID, 0, false, "crashed", "", "")
-				return
-			}
-			_ = os.Remove(zipFile) // Cleanup zip
-		}
-
-		// 3. Move files if they are inside a 'Server' subfolder
-		serverSubDir := filepath.Join(workDir, "Server")
-		if info, err := os.Stat(serverSubDir); err == nil && info.IsDir() {
-			srv.WriteLog("[INSTALL] Moving files from Server/ to root...")
-			subs, _ := os.ReadDir(serverSubDir)
-			for _, s := range subs {
-				_ = os.Rename(filepath.Join(serverSubDir, s.Name()), filepath.Join(workDir, s.Name()))
-			}
-			_ = os.Remove(serverSubDir)
+		// Check if it produced files
+		entries, _ := os.ReadDir(workDir)
+		if len(entries) == 0 {
+			srv.WriteLog("[INSTALL-WARN] Downloader produced no files. Auth may have failed.")
+			i.reportProgress(serverID, 0, false, "crashed", "", "")
+			return
 		}
 
 		// Success
-		log.Printf("[installer-%s] Installation completed. Auto-starting...", serverID)
-		srv.WriteLog("[INSTALL-DONE] Installation completed successfully.")
+		log.Printf("[installer-%s] Installation completed. Starting server...", serverID)
+		srv.WriteLog("[INSTALL-DONE] Installation completed. Starting server...")
 		if err := srv.Start(); err != nil {
 			log.Printf("[installer-%s] Auto-start failed: %v", serverID, err)
 			srv.WriteLog("[INSTALL-WARN] Auto-start failed: " + err.Error())
-			i.reportProgress(serverID, 100, false, "crashed", "", "")
+			i.reportProgress(serverID, 100, false, "stopped", "", "")
 		} else {
 			i.nm.SyncMasterRoutes(context.Background())
 			i.reportProgress(serverID, 100, false, "running", "", "")

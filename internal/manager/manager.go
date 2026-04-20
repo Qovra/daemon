@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -47,6 +48,7 @@ type ServerManager struct {
 	desiredState State
 	actualState  State
 	cmd          *exec.Cmd
+	stdinPipe    *io.PipeWriter // writable stdin for interactive commands
 	stdoutBuf    *ringBuffer
 	startTime    time.Time
 }
@@ -170,6 +172,14 @@ func (sm *ServerManager) spawn() error {
 	cmd := exec.Command(binaryPath, args...)
 	cmd.Dir = workDir // Critical: run in its isolated folder
 
+	// For game servers, wire an interactive stdin pipe for in-game commands
+	var stdinReader *io.PipeReader
+	var stdinWriter *io.PipeWriter
+	if sm.serverType == "game" {
+		stdinReader, stdinWriter = io.Pipe()
+		cmd.Stdin = stdinReader
+	}
+
 	// We use a multi-writer/scanner to BOTH capture logs in the buffer AND detect Auth codes
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
@@ -215,6 +225,9 @@ func (sm *ServerManager) spawn() error {
 	sm.cmd = cmd
 	sm.actualState = StateRunning
 	sm.startTime = time.Now()
+	if stdinWriter != nil {
+		sm.stdinPipe = stdinWriter
+	}
 
 	log.Printf("[server-%s] spawned successfully mapping port %d (PID %d)", sm.ID, sm.port, sm.cmd.Process.Pid)
 
@@ -362,6 +375,20 @@ func (sm *ServerManager) WriteLog(line string) {
 // GetLogs returns the accumulated stdout/stderr lines as a string.
 func (sm *ServerManager) GetLogs() string {
 	return sm.stdoutBuf.String()
+}
+
+// SendCommand writes a command line to the running server's stdin.
+func (sm *ServerManager) SendCommand(cmd string) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sm.stdinPipe == nil || sm.actualState != StateRunning {
+		return errors.New("server is not running or stdin is not available")
+	}
+	if !strings.HasSuffix(cmd, "\n") {
+		cmd += "\n"
+	}
+	_, err := io.WriteString(sm.stdinPipe, cmd)
+	return err
 }
 
 // --- simple concurrency-safe ring buffer for logs ---

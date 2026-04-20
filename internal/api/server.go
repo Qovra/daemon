@@ -2,7 +2,6 @@ package api
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -10,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -43,9 +41,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/node/status", s.handleNodeStatus)
 	mux.HandleFunc("/api/node/master/status", s.handleMasterStatus)
 	mux.HandleFunc("/api/node/master/action", s.withAuth(s.handleMasterAction))
-	mux.HandleFunc("/api/node/cli-auth", s.withAuth(s.handleCLIAuth))
-
-	// Server-specific management
+	mux.HandleFunc("/api/node/cli-auth", s.handleCLIAuthStream) // WebSocket, auth via token query param
 	mux.HandleFunc("/api/servers/create", s.withAuth(s.handleCreateServer))
 	mux.HandleFunc("/api/servers/start", s.withAuth(s.handleServerAction("start")))
 	mux.HandleFunc("/api/servers/stop", s.withAuth(s.handleServerAction("stop")))
@@ -56,6 +52,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/servers/delete", s.withAuth(s.handleDeleteServer))
 	mux.HandleFunc("/api/servers/install", s.withAuth(s.handleInstallServer))
 	mux.HandleFunc("/api/node/sync-routes", s.withAuth(s.handleSyncRoutes))
+	mux.HandleFunc("/api/servers/command", s.withAuth(s.handleServerCommand))
+	mux.HandleFunc("/api/node/cli-auth", s.handleCLIAuthStream) // WebSocket, auth via token query param
 
 	// Wrap mux with CORS middleware
 	handler := s.withCORS(mux)
@@ -193,67 +191,89 @@ func (s *Server) handleServerStatus(w http.ResponseWriter, r *http.Request) {
 	s.json(w, srv.Status())
 }
 
-func (s *Server) handleCLIAuth(w http.ResponseWriter, r *http.Request) {
+// handleCLIAuthStream streams the downloader's output in real-time via WebSocket.
+func (s *Server) handleCLIAuthStream(w http.ResponseWriter, r *http.Request) {
+	// Token auth via query param (WebSocket)
+	if r.URL.Query().Get("token") != s.cfg.APIToken {
+		http.Error(w, "unauthorized", http.StatusForbidden)
+		return
+	}
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("[api] cli-auth WebSocket upgrade failed: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	send := func(msg string) bool {
+		return conn.WriteMessage(websocket.TextMessage, []byte(msg)) == nil
+	}
+
+	send("[QOVRA] Starting hytale-downloader...\n")
+
+	cmd := exec.CommandContext(r.Context(), "/usr/local/bin/hytale-downloader")
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
+
+	if err := cmd.Start(); err != nil {
+		send("[QOVRA-ERR] Failed to start downloader: " + err.Error() + "\n")
+		return
+	}
+
+	// Read loop: pipe stdout to WebSocket
+	done := make(chan bool, 2)
+	pipe := func(r io.Reader, prefix string) {
+		scanner := bufio.NewScanner(r)
+		for scanner.Scan() {
+			if !send(prefix + scanner.Text() + "\n") {
+				break
+			}
+		}
+		done <- true
+	}
+
+	go pipe(stdout, "")
+	go pipe(stderr, "[ERR] ")
+
+	<-done
+	<-done
+
+	if err := cmd.Wait(); err != nil {
+		send("[QOVRA] Downloader exited: " + err.Error() + "\n")
+	} else {
+		send("[QOVRA] Downloader completed successfully.\n")
+	}
+}
+
+// handleServerCommand writes a command to a running server's stdin.
+func (s *Server) handleServerCommand(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// We run the downloader without arguments to trigger the auth check/login
-	// Timeout of 5s to capture the initial auth message
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, "/usr/local/bin/hytale-downloader")
-	stdout, _ := cmd.StdoutPipe()
-	if err := cmd.Start(); err != nil {
-		s.json(w, map[string]string{"error": "Failed to run downloader: " + err.Error()})
+	serverID := r.URL.Query().Get("id")
+	srv, ok := s.node.GetServer(serverID)
+	if !ok {
+		http.Error(w, "server not found", http.StatusNotFound)
 		return
 	}
 
-	reURL := regexp.MustCompile(`https?://[a-zA-Z0-9./?=_-]+`)
-	reCode := regexp.MustCompile(`[A-Z0-9]{4}-[A-Z0-9]{4}`)
-
-	var authURL, authCode string
-	scanner := bufio.NewScanner(stdout)
-	
-	// Read output in a separate goroutine to avoid blocking if the downloader waits for input
-	done := make(chan bool)
-	go func() {
-		for scanner.Scan() {
-			line := scanner.Text()
-			if foundURL := reURL.FindString(line); foundURL != "" && authURL == "" {
-				authURL = foundURL
-			}
-			if foundCode := reCode.FindString(line); foundCode != "" && authCode == "" {
-				authCode = foundCode
-			}
-			if authURL != "" && authCode != "" {
-				break
-			}
-		}
-		done <- true
-	}()
-
-	select {
-	case <-done:
-		// Captured what we needed or scanner finished
-	case <-ctx.Done():
-		// Timeout reached
+	var body struct {
+		Command string `json:"command"`
 	}
-
-	// Attempt to kill it so we don't leave it dangling
-	_ = cmd.Process.Kill()
-
-	if authURL == "" {
-		s.json(w, map[string]string{"message": "No authentication required or downloader already logged in."})
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Command == "" {
+		http.Error(w, "missing command", http.StatusBadRequest)
 		return
 	}
 
-	s.json(w, map[string]string{
-		"auth_url":  authURL,
-		"auth_code": authCode,
-	})
+	if err := srv.SendCommand(body.Command); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	s.json(w, map[string]string{"message": "command sent"})
 }
 
 func (s *Server) handleInstallServer(w http.ResponseWriter, r *http.Request) {

@@ -92,7 +92,7 @@ func (nm *NodeManager) EnsureMasterProxy(ctx context.Context) error {
 	masterID := "00000000-0000-0000-0000-000000005520"
 	
 	// We use 0 as RAM for master as it doesn't represent a game server
-	nm.MasterProxy = NewServerManager(nm.cfg, masterID, "Master Proxy", 5520, 0, nm.NodeIP, "master", "proxy", "")
+	nm.MasterProxy = NewServerManager(nm.cfg, masterID, nm.NodeID, "Master Proxy", 5520, 0, nm.NodeIP, "master", "proxy", "")
 	
 	// Sync initial routes before starting
 	if err := nm.SyncMasterRoutes(ctx); err != nil {
@@ -237,7 +237,7 @@ func (nm *NodeManager) LoadExistingServers(ctx context.Context) error {
 			continue
 		}
 
-		srv := NewServerManager(nm.cfg, id, name, port, ram, nm.NodeIP, version, sType, hostname)
+		srv := NewServerManager(nm.cfg, id, nm.NodeID, name, port, ram, nm.NodeIP, version, sType, hostname)
 		nm.AddServer(id, srv)
 		
 		if status == "running" {

@@ -2,15 +2,18 @@ package manager
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Qovra/hytale-daemon/internal/config"
@@ -31,6 +34,7 @@ const (
 type ServerManager struct {
 	cfg          *config.DaemonConfig
 	ID           string
+	NodeID       string
 	Name         string
 	port         int
 	allocatedRAM int
@@ -38,7 +42,7 @@ type ServerManager struct {
 	version      string
 	serverType   string // "proxy" or "game"
 	hostname     string
-	
+
 	mu           sync.Mutex
 	desiredState State
 	actualState  State
@@ -48,10 +52,11 @@ type ServerManager struct {
 }
 
 // NewServerManager instantiates a struct to manage a specific server process.
-func NewServerManager(cfg *config.DaemonConfig, id, name string, port, ram int, nodeIP, version, sType, hostname string) *ServerManager {
+func NewServerManager(cfg *config.DaemonConfig, id, nodeID, name string, port, ram int, nodeIP, version, sType, hostname string) *ServerManager {
 	return &ServerManager{
 		cfg:          cfg,
 		ID:           id,
+		NodeID:       nodeID,
 		Name:         name,
 		port:         port,
 		allocatedRAM: ram,
@@ -61,7 +66,7 @@ func NewServerManager(cfg *config.DaemonConfig, id, name string, port, ram int, 
 		hostname:     hostname,
 		desiredState: StateStopped,
 		actualState:  StateStopped,
-		stdoutBuf:    newRingBuffer(1024 * 64), 
+		stdoutBuf:    newRingBuffer(100 * 1024), // 100KB ring buffer
 	}
 }
 
@@ -93,7 +98,7 @@ func (sm *ServerManager) spawn() error {
 	// A real pterodactyl equivalent would copy the base template to a volume folder
 	// and run it chrooted/dockerized. For this daemon, we'll run the binary directly
 	// but specifying its own isolated config file.
-	
+
 	// Ensure isolated execution folder exists
 	workDir := sm.WorkDir()
 	_ = os.MkdirAll(workDir, 0755)
@@ -106,10 +111,12 @@ func (sm *ServerManager) spawn() error {
 		// 1. Determine execution directory and asset location via recursive search
 		var jarPath string
 		var jarExecDir string
-		
+
 		// We look for HytaleServer.jar in workDir and up to 2 levels deep
 		filepath.Walk(workDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil || jarPath != "" { return nil }
+			if err != nil || jarPath != "" {
+				return nil
+			}
 			if !info.IsDir() && info.Name() == "HytaleServer.jar" {
 				rel, _ := filepath.Rel(workDir, path)
 				depth := len(strings.Split(rel, string(os.PathSeparator)))
@@ -127,7 +134,7 @@ func (sm *ServerManager) spawn() error {
 
 		execDir := jarExecDir
 		assetsPath := "Assets.zip"
-		
+
 		// Try to find Assets.zip relative to the JAR
 		if _, err := os.Stat(filepath.Join(execDir, "Assets.zip")); err == nil {
 			assetsPath = "Assets.zip"
@@ -136,7 +143,7 @@ func (sm *ServerManager) spawn() error {
 		}
 
 		binaryPath = "java"
-		
+
 		// 2. Build official arguments
 		args = []string{
 			fmt.Sprintf("-Xmx%dM", sm.allocatedRAM),
@@ -159,14 +166,14 @@ func (sm *ServerManager) spawn() error {
 		// Default Proxy behavior
 		args = []string{"-config", "config.json"}
 	}
-	
+
 	cmd := exec.Command(binaryPath, args...)
 	cmd.Dir = workDir // Critical: run in its isolated folder
 
 	// We use a multi-writer/scanner to BOTH capture logs in the buffer AND detect Auth codes
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
-	
+
 	if err := cmd.Start(); err != nil {
 		sm.actualState = StateCrashed
 		return fmt.Errorf("failed to spawn server process %s: %w", sm.ID, err)
@@ -186,11 +193,11 @@ func (sm *ServerManager) spawn() error {
 			// Detect Auth URL/Code
 			url := reURL.FindString(line)
 			code := reCode.FindString(line)
-			if (url != "" || code != "") && sm.nodeCfg != nil {
+			if (url != "" || code != "") && sm.cfg != nil {
 				// Report to backend as "installation" data but for a running server
 				go func(u, c string) {
 					// We reuse the installer's reporting logic essentially
-					installer := NewInstaller(sm.nodeCfg.NodeID, sm.nodeCfg.BackendURL, sm.nodeCfg.APIToken, nil)
+					installer := NewInstaller(sm.NodeID, sm.cfg.BackendURL, sm.cfg.APIToken, nil)
 					// State is "running" because this is server identity auth, not installer auth
 					installer.reportProgress(sm.ID, 100, false, "running", u, c)
 				}(url, code)
@@ -208,7 +215,7 @@ func (sm *ServerManager) spawn() error {
 	sm.cmd = cmd
 	sm.actualState = StateRunning
 	sm.startTime = time.Now()
-	
+
 	log.Printf("[server-%s] spawned successfully mapping port %d (PID %d)", sm.ID, sm.port, sm.cmd.Process.Pid)
 
 	// Sync states to DB
@@ -279,7 +286,7 @@ func (sm *ServerManager) Stop() error {
 	}
 
 	sm.desiredState = StateStopped
-	
+
 	if sm.cmd != nil && sm.cmd.Process != nil {
 		log.Printf("[server-%s] sending SIGTERM to PID %d", sm.ID, sm.cmd.Process.Pid)
 		if err := sm.cmd.Process.Signal(syscall.SIGTERM); err != nil {
@@ -311,7 +318,7 @@ func (sm *ServerManager) updateDatabaseState(status string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	
+
 	_, err := database.Pool.Exec(ctx, "UPDATE servers SET status = $1, updated_at = NOW() WHERE id = $2", status, sm.ID)
 	if err != nil {
 		log.Printf("[server-%s] DB state update failed: %v", sm.ID, err)
@@ -343,8 +350,12 @@ func (sm *ServerManager) Status() StatusOutput {
 }
 
 func (sm *ServerManager) WriteLog(line string) {
-	if sm.stdoutBuf == nil { return }
-	if !strings.HasSuffix(line, "\n") { line += "\n" }
+	if sm.stdoutBuf == nil {
+		return
+	}
+	if !strings.HasSuffix(line, "\n") {
+		line += "\n"
+	}
 	sm.stdoutBuf.Write([]byte(line))
 }
 

@@ -1,18 +1,16 @@
 package manager
 
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/Qovra/hytale-daemon/internal/config"
@@ -165,14 +163,47 @@ func (sm *ServerManager) spawn() error {
 	cmd := exec.Command(binaryPath, args...)
 	cmd.Dir = workDir // Critical: run in its isolated folder
 
-	// Tee output so we capture logs dynamically
-	cmd.Stdout = sm.stdoutBuf
-	cmd.Stderr = sm.stdoutBuf
-
+	// We use a multi-writer/scanner to BOTH capture logs in the buffer AND detect Auth codes
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
+	
 	if err := cmd.Start(); err != nil {
 		sm.actualState = StateCrashed
 		return fmt.Errorf("failed to spawn server process %s: %w", sm.ID, err)
 	}
+
+	// Regex for OAuth2 detection
+	reURL := regexp.MustCompile(`https?://[a-zA-Z0-9./?=_-]+`)
+	reCode := regexp.MustCompile(`[A-Z0-9]{4}-[A-Z0-9]{4}`)
+
+	// Scanner to detect auth links and pipe to buffer
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			line := scanner.Text()
+			sm.WriteLog(line)
+
+			// Detect Auth URL/Code
+			url := reURL.FindString(line)
+			code := reCode.FindString(line)
+			if (url != "" || code != "") && sm.nodeCfg != nil {
+				// Report to backend as "installation" data but for a running server
+				go func(u, c string) {
+					// We reuse the installer's reporting logic essentially
+					installer := NewInstaller(sm.nodeCfg.NodeID, sm.nodeCfg.BackendURL, sm.nodeCfg.APIToken, nil)
+					// State is "running" because this is server identity auth, not installer auth
+					installer.reportProgress(sm.ID, 100, false, "running", u, c)
+				}(url, code)
+			}
+		}
+	}()
+
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			sm.WriteLog("[ERR] " + scanner.Text())
+		}
+	}()
 
 	sm.cmd = cmd
 	sm.actualState = StateRunning

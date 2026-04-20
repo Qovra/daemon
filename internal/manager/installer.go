@@ -1,11 +1,13 @@
 package manager
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -113,11 +115,38 @@ func (i *Installer) InstallGameServer(ctx context.Context, serverID string) erro
 			}
 		}
 
-		if err := cmd.Wait(); err != nil {
-			log.Printf("[installer-%s] Downloader exited with error: %v", serverID, err)
-			srv.WriteLog("[INSTALL-CRASH] Downloader exited with error: " + err.Error())
-			i.reportProgress(serverID, 0, false, "crashed", "", "")
-			return
+		// 2. Discover ZIP file
+		files, _ := os.ReadDir(workDir)
+		var zipFile string
+		for _, f := range files {
+			if strings.HasSuffix(f.Name(), ".zip") && f.Name() != "Assets.zip" {
+				zipFile = filepath.Join(workDir, f.Name())
+				break
+			}
+		}
+
+		if zipFile == "" {
+			log.Printf("[installer-%s] No ZIP file found after downloader exit. Checking if it extracted directly...", serverID)
+		} else {
+			srv.WriteLog("[INSTALL] Extracting game files: " + filepath.Base(zipFile))
+			if err := unzip(zipFile, workDir); err != nil {
+				log.Printf("[installer-%s] Failed to unzip: %v", serverID, err)
+				srv.WriteLog("[INSTALL-ERR] Extraction failed: " + err.Error())
+				i.reportProgress(serverID, 0, false, "crashed", "", "")
+				return
+			}
+			_ = os.Remove(zipFile) // Cleanup zip
+		}
+
+		// 3. Move files if they are inside a 'Server' subfolder
+		serverSubDir := filepath.Join(workDir, "Server")
+		if info, err := os.Stat(serverSubDir); err == nil && info.IsDir() {
+			srv.WriteLog("[INSTALL] Moving files from Server/ to root...")
+			subs, _ := os.ReadDir(serverSubDir)
+			for _, s := range subs {
+				_ = os.Rename(filepath.Join(serverSubDir, s.Name()), filepath.Join(workDir, s.Name()))
+			}
+			_ = os.Remove(serverSubDir)
 		}
 
 		// Success
@@ -133,6 +162,49 @@ func (i *Installer) InstallGameServer(ctx context.Context, serverID string) erro
 		}
 	}()
 
+	return nil
+}
+
+func unzip(src, dest string) error {
+	r, err := zip.OpenReader(src)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		fpath := filepath.Join(dest, f.Name)
+		if !strings.HasPrefix(fpath, filepath.Clean(dest)+string(os.PathSeparator)) {
+			return fmt.Errorf("illegal file path: %s", fpath)
+		}
+
+		if f.FileInfo().IsDir() {
+			os.MkdirAll(fpath, os.ModePerm)
+			continue
+		}
+
+		if err = os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
+			return err
+		}
+
+		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		if err != nil {
+			return err
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+
+		_, err = io.Copy(outFile, rc)
+		outFile.Close()
+		rc.Close()
+
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

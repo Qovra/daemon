@@ -35,6 +35,12 @@ func NewServer(cfg *config.DaemonConfig, node *manager.NodeManager) *Server {
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
 
+	// Node-level management
+	mux.HandleFunc("/api/node/status", s.handleNodeStatus)
+	mux.HandleFunc("/api/node/master/status", s.handleMasterStatus)
+	mux.HandleFunc("/api/node/master/action", s.withAuth(s.handleMasterAction))
+	mux.HandleFunc("/api/node/cli-auth", s.withAuth(s.handleCLIAuth))
+
 	// Server-specific management
 	mux.HandleFunc("/api/servers/create", s.withAuth(s.handleCreateServer))
 	mux.HandleFunc("/api/servers/start", s.withAuth(s.handleServerAction("start")))
@@ -185,6 +191,69 @@ func (s *Server) handleServerStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.json(w, srv.Status())
+}
+
+func (s *Server) handleCLIAuth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// We run the downloader without arguments to trigger the auth check/login
+	// Timeout of 5s to capture the initial auth message
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "/usr/local/bin/hytale-downloader")
+	stdout, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		s.json(w, map[string]string{"error": "Failed to run downloader: " + err.Error()})
+		return
+	}
+
+	reURL := regexp.MustCompile(`https?://[a-zA-Z0-9./?=_-]+`)
+	reCode := regexp.MustCompile(`[A-Z0-9]{4}-[A-Z0-9]{4}`)
+
+	var authURL, authCode string
+	scanner := bufio.NewScanner(stdout)
+	
+	// Read output in a separate goroutine to avoid blocking if the downloader waits for input
+	done := make(chan bool)
+	go func() {
+		for scanner.Scan() {
+			line := scanner.Text()
+			if foundURL := reURL.FindString(line); foundURL != "" && authURL == "" {
+				authURL = foundURL
+			}
+			if foundCode := reCode.FindString(line); foundCode != "" && authCode == "" {
+				authCode = foundCode
+			}
+			if authURL != "" && authCode != "" {
+				break
+			}
+		}
+		done <- true
+	}()
+
+	select {
+	case <-done:
+		// Captured what we needed or scanner finished
+	case <-ctx.Done():
+		// Timeout reached
+	}
+
+	// Attempt to kill it so we don't leave it dangling
+	_ = cmd.Process.Kill()
+
+	if authURL == "" {
+		s.json(w, map[string]string{"message": "No authentication required or downloader already logged in."})
+		return
+	}
+
+	s.json(w, map[string]string{
+		"auth_url":  authURL,
+		"auth_code": authCode,
+	})
 }
 
 func (s *Server) handleInstallServer(w http.ResponseWriter, r *http.Request) {

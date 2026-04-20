@@ -180,7 +180,6 @@ func (sm *ServerManager) monitor(cmd *exec.Cmd) {
 	}()
 }
 
-// Stop sends SIGTERM to the proxy and disables auto-restart.
 func (sm *ServerManager) Stop() error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -195,6 +194,13 @@ func (sm *ServerManager) Stop() error {
 		log.Printf("[server-%s] sending SIGTERM to PID %d", sm.ID, sm.cmd.Process.Pid)
 		if err := sm.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 			sm.cmd.Process.Kill()
+		}
+	} else {
+		// ALready crashed / not running, force it to stopped
+		sm.actualState = StateStopped
+		if sm.ID != "00000000-0000-0000-0000-000000005520" {
+			sm.updateDatabaseState("stopped")
+			logger.LogEvent(context.Background(), "info", "server", sm.ID, "server.stop", "Server stopped cleanly", nil)
 		}
 	}
 

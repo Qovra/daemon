@@ -1,3 +1,5 @@
+[![Release](https://github.com/Qovra/daemon/actions/workflows/release.yml/badge.svg)](https://github.com/Qovra/daemon/actions/workflows/release.yml)
+
 # Hytale Daemon
 
 Hytale-Daemon is a lightweight, standalone process manager written in Go. Its sole purpose is to supervise your instances of `Hytale-Proxy`, ensuring maximum uptime and preventing crashes. Furthermore, it embeds a secure HTTP JSON REST API designed specifically to connect with web-based Control Panels (e.g. built in React/Node.js).

@@ -266,6 +266,13 @@ func (sm *ServerManager) Status() StatusOutput {
 	return out
 }
 
+func (sm *ServerManager) WriteLog(line string) {
+	if sm.stdoutBuf == nil { return }
+	if !strings.HasSuffix(line, "\n") { line += "\n" }
+	sm.stdoutBuf.Write([]byte(line))
+}
+
+// GetLogs returns the accumulated stdout/stderr lines as a string.
 func (sm *ServerManager) GetLogs() string {
 	return sm.stdoutBuf.String()
 }

@@ -79,6 +79,7 @@ func (i *Installer) InstallGameServer(ctx context.Context, serverID string) erro
 			for errScanner.Scan() {
 				line := errScanner.Text()
 				log.Printf("[installer-%s][stderr] %s", serverID, line)
+				srv.WriteLog("[INSTALL-ERR] " + line)
 			}
 		}()
 
@@ -86,6 +87,7 @@ func (i *Installer) InstallGameServer(ctx context.Context, serverID string) erro
 		for scanner.Scan() {
 			line := scanner.Text()
 			log.Printf("[installer-%s] %s", serverID, line)
+			srv.WriteLog("[INSTALL] " + line)
 
 			// Detect Auth URL
 			if foundURL := reURL.FindString(line); foundURL != "" && authURL == "" {
@@ -113,14 +115,17 @@ func (i *Installer) InstallGameServer(ctx context.Context, serverID string) erro
 
 		if err := cmd.Wait(); err != nil {
 			log.Printf("[installer-%s] Downloader exited with error: %v", serverID, err)
+			srv.WriteLog("[INSTALL-CRASH] Downloader exited with error: " + err.Error())
 			i.reportProgress(serverID, 0, false, "crashed", "", "")
 			return
 		}
 
 		// Success
 		log.Printf("[installer-%s] Installation completed. Auto-starting...", serverID)
+		srv.WriteLog("[INSTALL-DONE] Installation completed successfully.")
 		if err := srv.Start(); err != nil {
 			log.Printf("[installer-%s] Auto-start failed: %v", serverID, err)
+			srv.WriteLog("[INSTALL-WARN] Auto-start failed: " + err.Error())
 			i.reportProgress(serverID, 100, false, "crashed", "", "")
 		} else {
 			i.nm.SyncMasterRoutes(context.Background())

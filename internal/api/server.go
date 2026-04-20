@@ -41,7 +41,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/node/status", s.handleNodeStatus)
 	mux.HandleFunc("/api/node/master/status", s.handleMasterStatus)
 	mux.HandleFunc("/api/node/master/action", s.withAuth(s.handleMasterAction))
-	mux.HandleFunc("/api/node/cli-auth", s.handleCLIAuthStream) // WebSocket, auth via token query param
+	mux.HandleFunc("/api/node/cli-auth", s.withAuth(s.handleCLIAuthStream)) // WebSocket, proxied from Backend
 	mux.HandleFunc("/api/servers/create", s.withAuth(s.handleCreateServer))
 	mux.HandleFunc("/api/servers/start", s.withAuth(s.handleServerAction("start")))
 	mux.HandleFunc("/api/servers/stop", s.withAuth(s.handleServerAction("stop")))
@@ -192,12 +192,6 @@ func (s *Server) handleServerStatus(w http.ResponseWriter, r *http.Request) {
 
 // handleCLIAuthStream streams the downloader's output in real-time via WebSocket.
 func (s *Server) handleCLIAuthStream(w http.ResponseWriter, r *http.Request) {
-	// Token auth via query param (WebSocket)
-	if r.URL.Query().Get("token") != s.cfg.APIToken {
-		http.Error(w, "unauthorized", http.StatusForbidden)
-		return
-	}
-
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("[api] cli-auth WebSocket upgrade failed: %v", err)
@@ -383,13 +377,6 @@ func (s *Server) handleServerLogs(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleServerConsole(w http.ResponseWriter, r *http.Request) {
 	serverID := r.URL.Query().Get("id")
-	token := r.URL.Query().Get("token")
-
-	// 1. Security: Check token (URL param for WebSockets)
-	if token != s.cfg.APIToken {
-		http.Error(w, "prohibido (token invalido)", http.StatusForbidden)
-		return
-	}
 
 	srv, ok := s.node.GetServer(serverID)
 	if !ok {

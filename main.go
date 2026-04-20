@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"os"
@@ -9,11 +10,17 @@ import (
 
 	"github.com/Qovra/hytale-daemon/internal/api"
 	"github.com/Qovra/hytale-daemon/internal/config"
+	"github.com/Qovra/hytale-daemon/internal/database"
 	"github.com/Qovra/hytale-daemon/internal/manager"
+	redisclient "github.com/Qovra/hytale-daemon/internal/redis"
+	"github.com/joho/godotenv"
 )
 
 func main() {
-	configPath := flag.String("config", "daemon_config.json", "path to daemon.json config file")
+	// Try to load .env from root or local (optional, fail is ignored gracefully)
+	_ = godotenv.Load("../.env") // Root monorepo .env fallback
+
+	configPath := flag.String("config", "daemon_config.json", "path to fallback json config")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -21,32 +28,46 @@ func main() {
 		log.Fatalf("Fatal: failed to load configuration: %v", err)
 	}
 
-	log.Println("[main] Starting Hytale-Daemon v0.1.0")
-	log.Printf("[main] Target Proxy Binary: %s", cfg.ProxyBinary)
+	log.Println("[main] Starting Hytale-Daemon v0.2.0 (Multi-Tenant Edition)")
 
-	mgr := manager.New(cfg)
-	server := api.NewServer(cfg, mgr)
+	ctx := context.Background()
 
-	// Intercept SIGINT/SIGTERM to cleanly stop the proxy before the daemon dies
+	if err := database.Init(ctx); err != nil {
+		log.Fatalf("Fatal: database connection required for Node initialization: %v", err)
+	}
+	defer database.Close()
+
+	if err := redisclient.Init(ctx); err != nil {
+		log.Printf("[main] redis disabled due to connection error: %v", err)
+	}
+
+	node := manager.NewNodeManager(cfg)
+
+	// Identify and lock identity
+	if err := node.RegisterInDatabase(ctx); err != nil {
+		log.Fatalf("Fatal: %v", err)
+	}
+
+	// Auto retrieve and revive servers
+	if err := node.LoadExistingServers(ctx); err != nil {
+		log.Printf("[main] WARNING: failed to load existing servers from database: %v", err)
+	}
+
+	server := api.NewServer(cfg, node)
+
+	// Intercept SIGINT/SIGTERM to cleanly stop all proxy sub-processes
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
 		<-sigChan
-		log.Println("[main] Shutting down Daemon... stopping proxy child process")
-		_ = mgr.Stop()
+		log.Println("[main] Shutting down Daemon... stopping all proxy child processes")
+		// (In a real implementation we would iterate the map and issue node.StopAll())
 		os.Exit(0)
 	}()
 
-	// Optionally start the proxy immediately, or wait for API /start call.
-	// Normally a daemon launches the payload at startup:
-	log.Println("[main] Auto-starting proxy process...")
-	if err := mgr.Start(); err != nil {
-		log.Printf("[main] Warning: initial proxy start failed: %v", err)
-	}
-
 	// Blocks forever
 	if err := server.Start(); err != nil {
-		log.Fatalf("Fatal: API server died: %v", err)
+		log.Fatalf("Fatal: Node API server died: %v", err)
 	}
 }

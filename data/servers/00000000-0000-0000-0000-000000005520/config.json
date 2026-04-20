@@ -1,0 +1,8 @@
+{
+  "handlers": [
+    {
+      "type": "forwarder"
+    }
+  ],
+  "listen": ":5520"
+}

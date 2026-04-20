@@ -2,15 +2,20 @@ package manager
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/Qovra/hytale-daemon/internal/config"
+	"github.com/Qovra/hytale-daemon/internal/database"
+	"github.com/Qovra/hytale-daemon/internal/logger"
 )
 
 // State enum
@@ -22,9 +27,17 @@ const (
 	StateCrashed State = "CRASHED"
 )
 
-// Manager supervises the Hytale-Proxy child process.
-type Manager struct {
+// ServerManager supervises a single isolated Hytale-Proxy child process inside this Node.
+type ServerManager struct {
 	cfg          *config.DaemonConfig
+	ID           string
+	port         int
+	allocatedRAM int
+	nodeIP       string
+	version      string
+	serverType   string // "proxy" or "game"
+	hostname     string
+	
 	mu           sync.Mutex
 	desiredState State
 	actualState  State
@@ -33,111 +46,155 @@ type Manager struct {
 	startTime    time.Time
 }
 
-// New creates a new Manager instance.
-func New(cfg *config.DaemonConfig) *Manager {
-	return &Manager{
+// NewServerManager instantiates a struct to manage a specific server process.
+func NewServerManager(cfg *config.DaemonConfig, id string, port, ram int, nodeIP, version, sType, hostname string) *ServerManager {
+	return &ServerManager{
 		cfg:          cfg,
+		ID:           id,
+		port:         port,
+		allocatedRAM: ram,
+		nodeIP:       nodeIP,
+		version:      version,
+		serverType:   sType,
+		hostname:     hostname,
 		desiredState: StateStopped,
 		actualState:  StateStopped,
-		stdoutBuf:    newRingBuffer(1024 * 64), // 64kb of log history max
+		stdoutBuf:    newRingBuffer(1024 * 64), 
 	}
 }
 
 // Start launches the proxy if it's not already running.
-func (m *Manager) Start() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (sm *ServerManager) Start() error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-	if m.actualState == StateRunning {
-		return errors.New("proxy is already running")
+	if sm.actualState == StateRunning {
+		return errors.New("server is already running")
 	}
 
-	m.desiredState = StateRunning
-	return m.spawn()
+	sm.desiredState = StateRunning
+	return sm.spawn()
 }
 
 // spawn internal assumes mutex is locked.
-func (m *Manager) spawn() error {
-	m.cmd = exec.Command(m.cfg.ProxyBinary, m.cfg.ProxyArgs...)
+func (sm *ServerManager) spawn() error {
+	// A real pterodactyl equivalent would copy the base template to a volume folder
+	// and run it chrooted/dockerized. For this daemon, we'll run the binary directly
+	// but specifying its own isolated config file.
 	
-	// Tee output so we capture logs dynamically
-	m.cmd.Stdout = m.stdoutBuf
-	m.cmd.Stderr = m.stdoutBuf
+	// Ensure isolated execution folder exists
+	workDir := filepath.Join("data", "servers", sm.ID)
+	_ = os.MkdirAll(workDir, 0755)
 
-	if err := m.cmd.Start(); err != nil {
-		m.actualState = StateCrashed
-		return fmt.Errorf("failed to spawn proxy: %w", err)
+	binaryPath := sm.cfg.ProxyBinary
+	var args []string
+
+	if sm.serverType == "game" {
+		// Mock: In a real Hytale server, this might be "java -jar server.jar"
+		// For now we look for a 'hytale-server' binary in the workdir
+		binaryPath = filepath.Join(workDir, "hytale-server")
+		if _, err := os.Stat(binaryPath); err != nil {
+			// If not found, use a mock script or return error
+			return fmt.Errorf("hytale-server binary not found. Please run installation first.")
+		}
+		args = []string{"-port", fmt.Sprint(sm.port)}
+	} else {
+		// Default Proxy behavior
+		args = []string{"-config", "config.json"}
+	}
+	
+	cmd := exec.Command(binaryPath, args...)
+	cmd.Dir = workDir // Critical: run in its isolated folder
+
+	// Tee output so we capture logs dynamically
+	cmd.Stdout = sm.stdoutBuf
+	cmd.Stderr = sm.stdoutBuf
+
+	if err := cmd.Start(); err != nil {
+		sm.actualState = StateCrashed
+		return fmt.Errorf("failed to spawn server proxy %s: %w", sm.ID, err)
 	}
 
-	m.actualState = StateRunning
-	m.startTime = time.Now()
-	log.Printf("[manager] proxy spawned successfully with PID %d", m.cmd.Process.Pid)
+	sm.cmd = cmd
+	sm.actualState = StateRunning
+	sm.startTime = time.Now()
+	
+	log.Printf("[server-%s] spawned successfully mapping port %d (PID %d)", sm.ID, sm.port, sm.cmd.Process.Pid)
+
+	// Sync states to DB
+	if sm.ID != "00000000-0000-0000-0000-000000005520" {
+		sm.updateDatabaseState("running")
+		logger.LogEvent(context.Background(), "info", "server", sm.ID, "server.start", "Server started successfully", nil)
+	}
 
 	// Goroutine to wait on process and auto-restart if desired
-	go m.monitor(m.cmd)
+	go sm.monitor(cmd)
 
 	return nil
 }
 
-// monitor waits for the process to exit. If it wasn't requested to stop,
-// it tries to auto-restart the process.
-func (m *Manager) monitor(cmd *exec.Cmd) {
+// monitor waits for the process to exit and reacts based on desired state.
+func (sm *ServerManager) monitor(cmd *exec.Cmd) {
 	err := cmd.Wait()
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-	// If this is no longer the active command (e.g. we restarted manually), do nothing.
-	if m.cmd != cmd {
+	// If this is no longer the active command (e.g. manual restart race condition)
+	if sm.cmd != cmd {
 		return
 	}
 
 	exitCode := cmd.ProcessState.ExitCode()
-	log.Printf("[manager] proxy process exited with code %d. Err: %v", exitCode, err)
+	log.Printf("[server-%s] process exited with code %d. Err: %v", sm.ID, exitCode, err)
+	sm.cmd = nil
 
-	m.cmd = nil
-
-	if m.desiredState == StateStopped {
-		m.actualState = StateStopped
-		log.Printf("[manager] proxy shut down cleanly by user request")
+	if sm.desiredState == StateStopped {
+		sm.actualState = StateStopped
+		if sm.ID != "00000000-0000-0000-0000-000000005520" {
+			sm.updateDatabaseState("stopped")
+			logger.LogEvent(context.Background(), "info", "server", sm.ID, "server.stop", "Server stopped cleanly", nil)
+		}
 		return
 	}
 
 	// Unexpected crash
-	m.actualState = StateCrashed
-	log.Printf("[manager] proxy crashed unexpectedly! Attempting to respawn in 3 seconds...")
+	sm.actualState = StateCrashed
+	if sm.ID != "00000000-0000-0000-0000-000000005520" {
+		sm.updateDatabaseState("crashed")
+		logger.LogEvent(context.Background(), "error", "server", sm.ID, "server.crashed", fmt.Sprintf("Server crashed unexpectedly with code %d", exitCode), nil)
+	}
 
-	// Launch respawn in background so we don't hold the mutex
+	log.Printf("[server-%s] crashed! Attempting to respawn in 3 seconds...", sm.ID)
+
 	go func() {
 		time.Sleep(3 * time.Second)
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		if m.desiredState == StateRunning && m.cmd == nil {
-			log.Printf("[manager] performing auto-restart...")
-			if err := m.spawn(); err != nil {
-				log.Printf("[manager] auto-restart failed: %v", err)
+		sm.mu.Lock()
+		defer sm.mu.Unlock()
+		if sm.desiredState == StateRunning && sm.cmd == nil {
+			log.Printf("[server-%s] performing auto-restart...", sm.ID)
+			if err := sm.spawn(); err != nil {
+				log.Printf("[server-%s] auto-restart failed: %v", sm.ID, err)
 			}
 		}
 	}()
 }
 
 // Stop sends SIGTERM to the proxy and disables auto-restart.
-func (m *Manager) Stop() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (sm *ServerManager) Stop() error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
-	if m.desiredState == StateStopped {
-		return errors.New("proxy is not running")
+	if sm.desiredState == StateStopped {
+		return errors.New("server is not running")
 	}
 
-	m.desiredState = StateStopped
+	sm.desiredState = StateStopped
 	
-	if m.cmd != nil && m.cmd.Process != nil {
-		log.Printf("[manager] sending SIGTERM to proxy PID %d", m.cmd.Process.Pid)
-		// On windows this will fail, but since we target macOS/Debian syscall.SIGTERM is correct.
-		if err := m.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-			// Fallback
-			m.cmd.Process.Kill()
+	if sm.cmd != nil && sm.cmd.Process != nil {
+		log.Printf("[server-%s] sending SIGTERM to PID %d", sm.ID, sm.cmd.Process.Pid)
+		if err := sm.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			sm.cmd.Process.Kill()
 		}
 	}
 
@@ -145,13 +202,27 @@ func (m *Manager) Stop() error {
 }
 
 // Restart is a helper to stop and immediately start again.
-func (m *Manager) Restart() error {
-	_ = m.Stop()
-	time.Sleep(1 * time.Second) // allow graceful shutdown before starting again
-	return m.Start()
+func (sm *ServerManager) Restart() error {
+	_ = sm.Stop()
+	time.Sleep(1 * time.Second)
+	return sm.Start()
 }
 
-// StatusOutput represents the current Daemon/Proxy health state.
+// updateDatabaseState wraps the context execution
+func (sm *ServerManager) updateDatabaseState(status string) {
+	if database.Pool == nil || sm.ID == "00000000-0000-0000-0000-000000005520" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	_, err := database.Pool.Exec(ctx, "UPDATE servers SET status = $1, updated_at = NOW() WHERE id = $2", status, sm.ID)
+	if err != nil {
+		log.Printf("[server-%s] DB state update failed: %v", sm.ID, err)
+	}
+}
+
+// StatusOutput represents the current state.
 type StatusOutput struct {
 	DesiredState string `json:"desired_state"`
 	ActualState  string `json:"actual_state"`
@@ -159,27 +230,24 @@ type StatusOutput struct {
 	Uptime       string `json:"uptime,omitempty"`
 }
 
-// Status returns a thread-safe snapshot of the proxy process status.
-func (m *Manager) Status() StatusOutput {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (sm *ServerManager) Status() StatusOutput {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 
 	out := StatusOutput{
-		DesiredState: string(m.desiredState),
-		ActualState:  string(m.actualState),
+		DesiredState: string(sm.desiredState),
+		ActualState:  string(sm.actualState),
 	}
 
-	if m.actualState == StateRunning && m.cmd != nil && m.cmd.Process != nil {
-		out.PID = m.cmd.Process.Pid
-		out.Uptime = time.Since(m.startTime).Round(time.Second).String()
+	if sm.actualState == StateRunning && sm.cmd != nil && sm.cmd.Process != nil {
+		out.PID = sm.cmd.Process.Pid
+		out.Uptime = time.Since(sm.startTime).Round(time.Second).String()
 	}
-
 	return out
 }
 
-// GetLogs returns the most recent captured standard output of the proxy.
-func (m *Manager) GetLogs() string {
-	return m.stdoutBuf.String()
+func (sm *ServerManager) GetLogs() string {
+	return sm.stdoutBuf.String()
 }
 
 // --- simple concurrency-safe ring buffer for logs ---
@@ -200,10 +268,7 @@ func (r *ringBuffer) Write(p []byte) (n int, err error) {
 
 	r.buf = append(r.buf, p...)
 	if len(r.buf) > r.max {
-		// slice the newest `max` bytes
 		r.buf = r.buf[len(r.buf)-r.max:]
-		// this slice allocation could be optimized into a circular buffer,
-		// but simple slice manipulation is fast enough for <1MB log histories.
 	}
 	return len(p), nil
 }

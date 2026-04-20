@@ -286,6 +286,14 @@ func (s *Server) handleServerLogs(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleServerConsole(w http.ResponseWriter, r *http.Request) {
 	serverID := r.URL.Query().Get("id")
+	token := r.URL.Query().Get("token")
+
+	// 1. Security: Check token (URL param for WebSockets)
+	if token != s.cfg.APIToken {
+		http.Error(w, "prohibido (token invalido)", http.StatusForbidden)
+		return
+	}
+
 	srv, ok := s.node.GetServer(serverID)
 	if !ok {
 		http.Error(w, "server not found", http.StatusNotFound)
@@ -301,18 +309,33 @@ func (s *Server) handleServerConsole(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[api] Console WebSocket connected for %s", serverID)
 
+	// 2. Read loop (required for detection of disconnects and to keep the connection alive)
+	stopChan := make(chan struct{})
+	go func() {
+		defer close(stopChan)
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				log.Printf("[api] WebSocket connection closed by client %s: %v", serverID, err)
+				break
+			}
+		}
+	}()
+
+	// 3. Write loop
 	// Stream existing logs first
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(srv.GetLogs())); err != nil {
 		return
 	}
 
-	// Simple polling of the ring buffer for new content (real implementation would use a pub/sub or watcher)
 	lastLogs := srv.GetLogs()
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
+		case <-stopChan:
+			return
 		case <-r.Context().Done():
 			return
 		case <-ticker.C:

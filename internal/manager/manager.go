@@ -105,38 +105,55 @@ func (sm *ServerManager) spawn() error {
 
 	if sm.serverType == "game" {
 		// Hytale Server Logic (Official Specs)
-		// 1. Determine execution directory and asset location
-		execDir := workDir
-		assetsPath := "Assets.zip"
-		jarName := "HytaleServer.jar"
+		// 1. Determine execution directory and asset location via recursive search
+		var jarPath string
+		var jarExecDir string
+		
+		// We look for HytaleServer.jar in workDir and up to 2 levels deep
+		filepath.Walk(workDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil || jarPath != "" { return nil }
+			if !info.IsDir() && info.Name() == "HytaleServer.jar" {
+				rel, _ := filepath.Rel(workDir, path)
+				depth := len(strings.Split(rel, string(os.PathSeparator)))
+				if depth <= 3 { // root is 1, subfolder is 2, sub-sub is 3
+					jarPath = path
+					jarExecDir = filepath.Dir(path)
+				}
+			}
+			return nil
+		})
 
-		// Downloader CLI often creates a 'Server/' subfolder
-		if _, err := os.Stat(filepath.Join(workDir, "Server", jarName)); err == nil {
-			execDir = filepath.Join(workDir, "Server")
-			assetsPath = "../Assets.zip" // Assets.zip is usually in parent
-		} else if _, err := os.Stat(filepath.Join(workDir, jarName)); err != nil {
-			return fmt.Errorf("HytaleServer.jar not found in %s or %s/Server/. Please run installation first.", workDir, workDir)
+		if jarPath == "" {
+			return fmt.Errorf("HytaleServer.jar not discovered in %s (searched up to 2 levels deep). Please verify installation logs.", workDir)
+		}
+
+		execDir := jarExecDir
+		assetsPath := "Assets.zip"
+		
+		// Try to find Assets.zip relative to the JAR
+		if _, err := os.Stat(filepath.Join(execDir, "Assets.zip")); err == nil {
+			assetsPath = "Assets.zip"
+		} else if _, err := os.Stat(filepath.Join(filepath.Dir(execDir), "Assets.zip")); err == nil {
+			assetsPath = "../Assets.zip"
 		}
 
 		binaryPath = "java"
 		
 		// 2. Build official arguments
-		// We use -Xmx to limit memory based on allocated RAM
 		args = []string{
 			fmt.Sprintf("-Xmx%dM", sm.allocatedRAM),
 			"-Xms128M",
 		}
 
-		// Enable AOT Cache if file exists
+		// Enable AOT Cache if file exists in the JAR directory
 		if _, err := os.Stat(filepath.Join(execDir, "HytaleServer.aot")); err == nil {
 			args = append(args, "-XX:AOTCache=HytaleServer.aot")
 		}
 
-		args = append(args, "-jar", jarName)
+		args = append(args, "-jar", "HytaleServer.jar")
 		args = append(args, "--assets", assetsPath)
 		args = append(args, "--bind", fmt.Sprintf("0.0.0.0:%d", sm.port))
 		args = append(args, "--auth-mode", "authenticated")
-		// args = append(args, "--disable-sentry") // Option for developer mode
 
 		// Update command execution directory
 		workDir = execDir

@@ -80,6 +80,16 @@ func (sm *ServerManager) Start() error {
 	return sm.spawn()
 }
 
+func (sm *ServerManager) WorkDir() string {
+	// We use Name-ID to ensure uniqueness while fulfilling user request for descriptive folders
+	workDir := filepath.Join("data", "servers", sm.ID)
+	if sm.Name != "" && sm.ID != "00000000-0000-0000-0000-000000005520" {
+		slugName := strings.ToLower(regexp.MustCompile(`[^a-zA-Z0-9]+`).ReplaceAllString(sm.Name, "-"))
+		workDir = filepath.Join("data", "servers", fmt.Sprintf("%s-%s", slugName, sm.ID))
+	}
+	return workDir
+}
+
 // spawn internal assumes mutex is locked.
 func (sm *ServerManager) spawn() error {
 	// A real pterodactyl equivalent would copy the base template to a volume folder
@@ -87,12 +97,7 @@ func (sm *ServerManager) spawn() error {
 	// but specifying its own isolated config file.
 	
 	// Ensure isolated execution folder exists
-	// We use Name-ID to ensure uniqueness while fulfilling user request for descriptive folders
-	workDir := filepath.Join("data", "servers", sm.ID)
-	if sm.Name != "" && sm.ID != "00000000-0000-0000-0000-000000005520" {
-		slugName := strings.ToLower(regexp.MustCompile(`[^a-zA-Z0-9]+`).ReplaceAllString(sm.Name, "-"))
-		workDir = filepath.Join("data", "servers", fmt.Sprintf("%s-%s", slugName, sm.ID))
-	}
+	workDir := sm.WorkDir()
 	_ = os.MkdirAll(workDir, 0755)
 
 	binaryPath := sm.cfg.ProxyBinary

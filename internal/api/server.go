@@ -1,12 +1,16 @@
 package api
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -51,16 +55,12 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/servers/console", s.withAuth(s.handleServerConsole))
 	mux.HandleFunc("/api/servers/delete", s.withAuth(s.handleDeleteServer))
 	mux.HandleFunc("/api/servers/install", s.withAuth(s.handleInstallServer))
-
-	// Node-level management
 	mux.HandleFunc("/api/node/sync-routes", s.withAuth(s.handleSyncRoutes))
-	mux.HandleFunc("/api/node/master/action", s.withAuth(s.handleMasterAction))
-	mux.HandleFunc("/api/node/master/status", s.withAuth(s.handleMasterStatus))
 
 	// Wrap mux with CORS middleware
 	handler := s.withCORS(mux)
 
-	log.Printf("[api] Daemon API listening securely on %s", s.cfg.APIListen)
+	log.Printf("[api] Daemon API listening on %s", s.cfg.APIListen)
 	return http.ListenAndServe(s.cfg.APIListen, handler)
 }
 
@@ -109,7 +109,7 @@ func (s *Server) handleCreateServer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Instantiate manager
-	srv := manager.NewServerManager(s.node.Config(), req.ID, req.Name, req.Port, req.RAM, s.node.IP(), req.Version, req.Type, req.Hostname)
+	srv := manager.NewServerManager(s.node.Config(), req.ID, s.node.NodeID, req.Name, req.Port, req.RAM, s.node.IP(), req.Version, req.Type, req.Hostname)
 	s.node.AddServer(req.ID, srv)
 
 	// Start it up via goroutine
@@ -288,6 +288,15 @@ func (s *Server) handleSyncRoutes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.json(w, map[string]string{"message": "master proxy routes synchronized"})
+}
+
+func (s *Server) handleNodeStatus(w http.ResponseWriter, r *http.Request) {
+	s.json(w, map[string]any{
+		"node_id":   s.node.NodeID,
+		"hostname":  s.cfg.NodeHostname,
+		"ip":        s.cfg.NodeIP,
+		"status":    "online",
+	})
 }
 
 func (s *Server) handleMasterAction(w http.ResponseWriter, r *http.Request) {
